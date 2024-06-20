@@ -5,19 +5,48 @@ import {
   AsyncValidCallbackType,
   RuleType,
   ErrorMessageType,
-  TypeName
+  TypeName,
+  PlainObject
 } from './types';
 import {
   checkRequired,
   createValidator,
   createValidatorAsync,
   isEmpty,
-  formatErrorMessage
+  shallowEqual,
+  formatErrorMessage,
+  get
 } from './utils';
+import { joinName } from './utils/formatErrorMessage';
 import locales, { MixedTypeLocale } from './locales';
 
+type ProxyOptions = {
+  // Check if the value exists
+  checkIfValueExists?: boolean;
+};
+
+export const schemaSpecKey = 'objectTypeSchemaSpec';
+
+/**
+ * Get the field type from the schema object
+ */
+export function getFieldType(schemaSpec: any, fieldName: string, nestedObject?: boolean) {
+  if (nestedObject) {
+    const namePath = fieldName.split('.').join(`.${schemaSpecKey}.`);
+    return get(schemaSpec, namePath);
+  }
+  return schemaSpec?.[fieldName];
+}
+
+/**
+ * Get the field value from the data object
+ */
+export function getFieldValue(data: PlainObject, fieldName: string, nestedObject?: boolean) {
+  return nestedObject ? get(data, fieldName) : data?.[fieldName];
+}
+
 export class MixedType<ValueType = any, DataType = any, E = ErrorMessageType, L = any> {
-  readonly typeName?: string;
+  readonly $typeName?: string;
   protected required = false;
   protected requiredCondition: (value: ValueType, data?: DataType) => boolean;
   protected requiredMessage: E | string = '';
@@ -25,22 +54,27 @@ export class MixedType<ValueType = any, DataType = any, E = ErrorMessageType, L 
   protected emptyAllowed = false;
   protected rules: RuleType<ValueType, DataType, E | string>[] = [];
   protected priorityRules: RuleType<ValueType, DataType, E | string>[] = [];
+  protected fieldLabel?: string;
 
-  schemaSpec: SchemaDeclaration<DataType, E>;
+  $schemaSpec: SchemaDeclaration<DataType, E>;
   value: any;
   locale: L & MixedTypeLocale;
 
+  // The field name that depends on the verification of other fields
+  otherFields: string[] = [];
+  proxyOptions: ProxyOptions = {};
+
   constructor(name?: TypeName) {
-    this.typeName = name;
+    this.$typeName = name;
     this.locale = Object.assign(name ? locales[name] : {}, locales.mixed) as L & MixedTypeLocale;
   }
 
   setSchemaOptions(schemaSpec: SchemaDeclaration<DataType, E>, value: any) {
-    this.schemaSpec = schemaSpec;
+    this.$schemaSpec = schemaSpec;
     this.value = value;
   }
 
-  check(value: ValueType = this.value, data?: DataType, fieldName?: string | string[]) {
+  check(value: any = this.value, data?: DataType, fieldName?: string | string[]) {
     if (typeof this.requiredCondition === 'function') {
       this.required = this.requiredCondition(value, data);
     }
@@ -48,16 +82,23 @@ export class MixedType<ValueType = any, DataType = any, E = ErrorMessageType, L 
     if (this.required && !checkRequired(value, this.trim, this.emptyAllowed)) {
       return {
         hasError: true,
-        errorMessage: formatErrorMessage(this.requiredMessage, { name: fieldName })
+        errorMessage: formatErrorMessage(this.requiredMessage, {
+          name: this.fieldLabel || joinName(fieldName)
+        })
       };
     }
 
-    const validator = createValidator<ValueType, DataType, E | string>(data, fieldName);
+    const validator = createValidator<ValueType, DataType, E | string>(
+      data,
+      fieldName,
+      this.fieldLabel
+    );
 
-    const checkStatus = validator(value, this.priorityRules);
+    const checkResult = validator(value, this.priorityRules);
 
-    if (checkStatus) {
-      return checkStatus;
+    // If the priority rule fails, return the result directly
+    if (checkResult) {
+      return checkResult;
     }
 
     if (!this.required && isEmpty(value)) {
@@ -68,24 +109,31 @@ export class MixedType<ValueType = any, DataType = any, E = ErrorMessageType, L 
   }
 
   checkAsync(
-    value: ValueType = this.value,
+    value: any = this.value,
     data?: DataType,
     fieldName?: string | string[]
   ): Promise<CheckResult<E | string>> {
     if (this.required && !checkRequired(value, this.trim, this.emptyAllowed)) {
       return Promise.resolve({
         hasError: true,
-        errorMessage: formatErrorMessage(this.requiredMessage, { name: fieldName })
+        errorMessage: formatErrorMessage(this.requiredMessage, {
+          name: this.fieldLabel || joinName(fieldName)
+        })
       });
     }
 
-    const validator = createValidatorAsync<ValueType, DataType, E | string>(data, fieldName);
+    const validator = createValidatorAsync<ValueType, DataType, E | string>(
+      data,
+      fieldName,
+      this.fieldLabel
+    );
 
     return new Promise(resolve =>
       validator(value, this.priorityRules)
-        .then((checkStatus: CheckResult<E | string> | void | null) => {
-          if (checkStatus) {
-            resolve(checkStatus);
+        .then((checkResult: CheckResult<E | string> | void | null) => {
+          // If the priority rule fails, return the result directly
+          if (checkResult) {
+            resolve(checkResult);
           }
         })
         .then(() => {
@@ -94,9 +142,9 @@ export class MixedType<ValueType = any, DataType = any, E = ErrorMessageType, L 
           }
         })
         .then(() => validator(value, this.rules))
-        .then((checkStatus: CheckResult<E | string> | void | null) => {
-          if (checkStatus) {
-            resolve(checkStatus);
+        .then((checkResult: CheckResult<E | string> | void | null) => {
+          if (checkResult) {
+            resolve(checkResult);
           }
           resolve({ hasError: false });
         })
@@ -119,7 +167,7 @@ export class MixedType<ValueType = any, DataType = any, E = ErrorMessageType, L 
   }
   addRule(
     onValid: ValidCallbackType<ValueType, DataType, E | string>,
-    errorMessage?: E | string,
+    errorMessage?: E | string | (() => E | string),
     priority?: boolean
   ) {
     this.pushRule({ onValid, errorMessage, priority });
@@ -160,20 +208,84 @@ export class MixedType<ValueType = any, DataType = any, E = ErrorMessageType, L 
 
   /**
    * Define data verification rules based on conditions.
-   * @param validator
+   * @param condition
    * @example
-   * MixedType().when(schema => {
-   *   return schema.filed1.check() ? NumberType().min(5) : NumberType().min(0);
+   *
+   * ```js
+   * SchemaModel({
+   *   option: StringType().isOneOf(['a', 'b', 'other']),
+   *   other: StringType().when(schema => {
+   *     const { value } = schema.option;
+   *     return value === 'other' ? StringType().isRequired('Other required') : StringType();
+   *   })
    * });
+   * ```
    */
   when(condition: (schemaSpec: SchemaDeclaration<DataType, E>) => MixedType) {
     this.addRule(
-      (value, data, filedName) => {
-        return condition(this.schemaSpec).check(value, data, filedName);
+      (value, data, fieldName) => {
+        return condition(this.$schemaSpec).check(value, data, fieldName);
       },
       undefined,
       true
     );
+    return this;
+  }
+
+  /**
+   * Check if the value is equal to the value of another field.
+   * @example
+   *
+   * ```js
+   * SchemaModel({
+   *   password: StringType().isRequired(),
+   *   confirmPassword: StringType().equalTo('password').isRequired()
+   * });
+   * ```
+   */
+  equalTo(fieldName: string, errorMessage: E | string = this.locale.equalTo) {
+    const errorMessageFunc = () => {
+      const type = getFieldType(this.$schemaSpec, fieldName, true);
+      return formatErrorMessage(errorMessage, { toFieldName: type?.fieldLabel || fieldName });
+    };
+
+    this.addRule((value, data) => {
+      return shallowEqual(value, get(data, fieldName));
+    }, errorMessageFunc);
+    return this;
+  }
+
+  /**
+   * After the field verification passes, proxy verification of other fields.
+   * @param options.checkIfValueExists When the value of other fields exists, the verification is performed (default: false)
+   * @example
+   *
+   * ```js
+   * SchemaModel({
+   *   password: StringType().isRequired().proxy(['confirmPassword']),
+   *   confirmPassword: StringType().equalTo('password').isRequired()
+   * });
+   * ```
+   */
+  proxy(fieldNames: string[], options?: ProxyOptions) {
+    this.otherFields = fieldNames;
+    this.proxyOptions = options || {};
+    return this;
+  }
+
+  /**
+   * Overrides the key name in error messages.
+   *
+   * @example
+   * ```js
+   * SchemaModel({
+   *  first_name: StringType().label('First name'),
+   *  age: NumberType().label('Age')
+   * });
+   * ```
+   */
+  label(label: string) {
+    this.fieldLabel = label;
     return this;
   }
 }
